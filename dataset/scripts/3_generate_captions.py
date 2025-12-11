@@ -1,186 +1,187 @@
-"""
-Step 3: Generate long-form captions (100-200 words) using HuggingFace Inference API
-Uses free HuggingFace Inference API with GPT-2 or similar model.
-"""
 import json
-import pandas as pd
-import requests
+import os
+import base64
 import time
 from pathlib import Path
-from tqdm import tqdm
-import os
 
-# HuggingFace Inference API (free tier available)
-# You can get a free token at https://huggingface.co/settings/tokens
-HF_API_URL = "https://api-inference.huggingface.co/models/gpt2"
-HF_API_TOKEN = os.environ.get("HF_API_TOKEN", None)
+import requests
 
-def generate_caption_with_hf_api(metadata_row, retries=3):
+# ============================================================
+# CONFIG
+# ============================================================
+
+# Path to your image_mappings.json (generated earlier)
+IMAGE_MAPPING_PATH = Path(__file__).resolve().parents[2] / "dataset" / "image_mapping.json"
+
+# Where to save captions
+OUTPUT_CAPTIONS_PATH = Path(__file__).resolve().parents[2] / "dataset" / "captions.json"
+
+# OpenAI API configuration for gpt-4o-mini vision
+OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  # set this in your env
+MODEL_NAME = "gpt-4o-mini"
+
+# Fixed prompt (target 100–120 words)
+BASE_PROMPT = (
+    "Generate a caption of 100-120 words.\n"
+    "1. Describe clearly what is pictured in the image (people, objects, background, colors, lighting).\n"
+    "2. At the end, state the type and style of the image (for example: 'It is an oil painting, a portrait in a mannerist style.').\n"
+    "Use simple, direct sentences."
+)
+
+# How long to sleep between requests (seconds) to avoid rate limits.
+# This is a conservative value to reduce 429 errors; you can lower it later
+# if you see very few rate-limit responses.
+REQUEST_SLEEP = 3.0
+
+
+# ============================================================
+# HELPER: encode image as base64
+# ============================================================
+
+def encode_image_to_base64(image_path: str) -> str:
+    with open(image_path, "rb") as f:
+        img_bytes = f.read()
+    return base64.b64encode(img_bytes).decode("utf-8")
+
+
+# ============================================================
+# HELPER: call OpenAI vision model
+# ============================================================
+
+def call_openai_gpt4o_mini(image_path: str, prompt: str) -> str:
     """
-    Generate a 150-200 word caption using HuggingFace Inference API.
+    Sends an image + prompt to OpenAI gpt-4o-mini and returns the caption text.
     """
-    artist = metadata_row.get('artist', 'Unknown artist')
-    title = metadata_row.get('title', 'Untitled')
-    period = metadata_row.get('period', 'Unknown period')
-    medium = metadata_row.get('medium', 'Unknown medium')
-    year = metadata_row.get('year', 'Unknown year')
-    nationality = metadata_row.get('nationality', 'Unknown nationality')
-    picture_data = metadata_row.get('picture_data', '')
-    
-    # Create prompt for caption generation
-    prompt = f"""Describe this artwork in detail:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not set in the environment.")
 
-Title: {title}
-Artist: {artist}
-Period: {period}
-Medium: {medium}
-Year: {year}
-Nationality: {nationality}
-Details: {picture_data}
+    img_b64 = encode_image_to_base64(image_path)
 
-Write a detailed 150-200 word description focusing on:
-- Visual composition and layout
-- Colors, lighting, and atmosphere
-- Subjects, figures, and objects depicted
-- Artistic style and technique
-- Symbolism and meaning
-- Textures and material qualities
-
-Description:"""
-    
-    headers = {}
-    if HF_API_TOKEN:
-        headers["Authorization"] = f"Bearer {HF_API_TOKEN}"
-    
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 300,  # Generate up to 300 tokens
-            "temperature": 0.8,
-            "top_p": 0.9,
-            "return_full_text": False,
-            "do_sample": True
-        }
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
     }
-    
-    for attempt in range(retries):
-        try:
-            response = requests.post(
-                HF_API_URL,
-                headers=headers,
-                json=payload,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                if isinstance(result, list) and len(result) > 0:
-                    generated_text = result[0].get('generated_text', '')
-                    # Clean up the generated text
-                    caption = generated_text.strip()
-                    # Ensure minimum length (if too short, add more details)
-                    if len(caption.split()) < 100:
-                        caption += f" The artwork demonstrates {period} style characteristics with {medium} technique. The composition reflects {nationality} artistic traditions from the {year if year != 'Unknown year' else 'historical'} period."
-                    return caption
-                else:
-                    print(f"Unexpected API response format: {result}")
-            elif response.status_code == 503:
-                # Model is loading, wait and retry
-                wait_time = 10 * (attempt + 1)
-                print(f"Model loading, waiting {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            else:
-                print(f"API error {response.status_code}: {response.text}")
-                
-        except Exception as e:
-            print(f"Error generating caption (attempt {attempt+1}/{retries}): {e}")
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff
-    
-    # Fallback: return a basic description if API fails
-    return f"This is an artwork titled '{title}' by {artist}, created during the {period} period. The piece uses {medium} as its medium and reflects {nationality} artistic traditions. The artwork showcases the characteristic style and techniques of the {period} movement, demonstrating the artist's mastery of composition, color, and form."
 
-def generate_captions(
-    metadata_csv="../../dataset/metadata.csv",
-    image_mapping_file="../../dataset/image_mapping.json",
-    output_json="../../dataset/captions.json",
-    max_images=None  # Set to None for all images, or a number for testing
-):
-    """
-    Generate captions for all images using HuggingFace Inference API.
-    """
-    print("Loading metadata...")
-    metadata_df = pd.read_csv(metadata_csv)
-    
-    print("Loading image mapping...")
-    with open(image_mapping_file, 'r', encoding='utf-8') as f:
-        image_mapping = json.load(f)
-    
-    valid_image_ids = set(image_mapping.keys())
-    print(f"Valid image IDs: {len(valid_image_ids)}")
-    
-    # Filter metadata to only include valid image IDs
-    # Try to match by image_id (filename base without extension)
-    metadata_df['image_id_str'] = metadata_df['image_id'].astype(str)
-    
-    # Match against valid image IDs (which are also filename bases)
-    metadata_df = metadata_df[metadata_df['image_id_str'].isin(valid_image_ids)]
-    
-    if len(metadata_df) == 0:
-        print("Warning: No metadata matched with image IDs. Trying alternative matching...")
-        # Try matching by original ID if filename matching failed
-        metadata_df = pd.read_csv(metadata_csv)
-        # For now, we'll proceed with what we have
-    
-    if max_images:
-        metadata_df = metadata_df.head(max_images)
-        print(f"Limiting to {max_images} images for testing")
-    
-    print(f"Generating captions for {len(metadata_df)} images...")
-    
-    captions = {}
-    
-    for idx, row in tqdm(metadata_df.iterrows(), total=len(metadata_df), desc="Generating captions"):
-        image_id = str(row['image_id'])
-        
+    # Build payload once (image is constant for this call)
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/jpeg;base64,{img_b64}"
+                        },
+                    },
+                ],
+            }
+        ],
+        "temperature": 0.4,
+        # Rough cap; 120 words ~ 170–200 tokens, plus prompt context
+        "max_tokens": 220,
+    }
+
+    # Simple retry with backoff for 429/rate limit
+    max_retries = 20
+    for attempt in range(max_retries):
         try:
-            caption = generate_caption_with_hf_api(row.to_dict())
+            resp = requests.post(
+                OPENAI_API_URL, headers=headers, json=payload, timeout=60
+            )
+
+            if resp.status_code == 429:
+                # Too many requests – back off and retry
+                wait = 4
+                print(f"  [Rate limit] 429 from OpenAI, slept {wait * (attempt + 1)}s and retrying...")
+                time.sleep(wait)
+                continue
+
+            resp.raise_for_status()
+            data = resp.json()
+
+            caption = data["choices"][0]["message"]["content"].strip()
+
+            # Enforce 100–120 words by truncation if needed
+            words = caption.split()
+            if len(words) > 120:
+                caption = " ".join(words[:120])
+            return caption
+
+        except requests.exceptions.RequestException as e:
+            # Network / HTTP issues – small backoff and retry
+            wait = 3 * (attempt + 1)
+            print(f"  [HTTP error] {e}. Sleeping {wait}s and retrying...")
+            time.sleep(wait)
+            continue
+
+    # If we reach here, all retries failed
+    raise RuntimeError("Failed to get caption from OpenAI after multiple retries.")
+
+
+# ============================================================
+# MAIN: read mappings, generate captions, save
+# ============================================================
+
+def main():
+    # --- load image mappings ---
+    if not IMAGE_MAPPING_PATH.exists():
+        raise FileNotFoundError(f"IMAGE_MAPPING_PATH not found: {IMAGE_MAPPING_PATH}")
+
+    with open(IMAGE_MAPPING_PATH, "r", encoding="utf-8") as f:
+        image_mappings = json.load(f)
+
+    # If you're resuming, load existing captions to avoid re-querying
+    if OUTPUT_CAPTIONS_PATH.exists():
+        try:
+            with open(OUTPUT_CAPTIONS_PATH, "r", encoding="utf-8") as f:
+                captions = json.load(f)
+        except json.JSONDecodeError:
+            print("captions.json is empty or corrupted, starting fresh.")
+            captions = {}
+    else:
+        captions = {}
+
+    total = len(image_mappings)
+    print(f"Found {total} images in mapping.")
+
+    for idx, (image_id, image_path) in enumerate(image_mappings.items(), start=1):
+        # Skip if we already have a caption for this image_id
+        if image_id in captions:
+            if idx % 1000 == 0:
+                print(f"[{idx}/{total}] {image_id} already captioned, skipping.")
+            continue
+
+        # Normalize path
+        image_path = str(Path(image_path))
+
+        if not os.path.exists(image_path):
+            print(f"[{idx}/{total}] WARNING: image not found at {image_path}, skipping.")
+            continue
+
+        print(f"[{idx}/{total}] Processing {image_id} -> {image_path}")
+
+        try:
+            caption = call_openai_gpt4o_mini(image_path, BASE_PROMPT)
             captions[image_id] = caption
+
+            # Save after each image (safer if script crashes)
+            OUTPUT_CAPTIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(OUTPUT_CAPTIONS_PATH, "w", encoding="utf-8") as f:
+                json.dump(captions, f, ensure_ascii=False, indent=2)
+
+            print(f"  ✓ Caption length: {len(caption.split())} words")
         except Exception as e:
-            print(f"\nError processing image {image_id}: {e}")
-            # Add a basic fallback caption
-            captions[image_id] = f"This artwork by {row.get('artist', 'Unknown')} is titled '{row.get('title', 'Untitled')}'."
-        
-        # Small delay to avoid rate limiting
-        time.sleep(0.5)
-        
-        # Save progress periodically (every 100 images)
-        if (idx + 1) % 100 == 0:
-            output_path = Path(output_json)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                json.dump(captions, f, indent=2, ensure_ascii=False)
-            print(f"\nProgress saved: {len(captions)} captions generated")
-    
-    # Save final captions
-    output_path = Path(output_json)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, 'w', encoding='utf-8') as f:
-        json.dump(captions, f, indent=2, ensure_ascii=False)
-    
-    print(f"\nSaved {len(captions)} captions to {output_path}")
-    return captions
+            print(f"  ✗ Error captioning image {image_id}: {e}")
+
+        # Respect rate limits
+        time.sleep(REQUEST_SLEEP)
+
+    print("Done. Captions saved to:", OUTPUT_CAPTIONS_PATH)
+
 
 if __name__ == "__main__":
-    import sys
-    max_images = None
-    if len(sys.argv) > 1:
-        max_images = int(sys.argv[1])
-    
-    if not HF_API_TOKEN:
-        print("Warning: HF_API_TOKEN not set. Using free tier (may be slower).")
-        print("Get a free token at: https://huggingface.co/settings/tokens")
-    
-    captions = generate_captions(max_images=max_images)
-
+    main()
